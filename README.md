@@ -5,7 +5,7 @@ In-browser **MP4 video compression**, **best-frame thumbnail extraction**, and *
 No server. No FFmpeg WASM runtime. No upload. The user's file never leaves their device.
 
 ```bash
-npm install @mdslabs/webcodecs-mp4
+npm install @mdslabs/wc-media-compressor-sdk
 ```
 
 ---
@@ -42,7 +42,7 @@ Output is always **H.264 MP4** (`avc1.4d001f` — Main Profile, Level 3.1).
 ### Compress a video
 
 ```ts
-import { compressVideo } from "@mdslabs/webcodecs-mp4";
+import { compressVideo } from "@mdslabs/wc-media-compressor-sdk";
 
 const result = await compressVideo(
   file, // File from <input type="file">
@@ -60,7 +60,7 @@ download(result.blob, "compressed.mp4");
 ### Extract the best-looking thumbnail
 
 ```ts
-import { extractThumbnail } from "@mdslabs/webcodecs-mp4";
+import { extractThumbnail } from "@mdslabs/wc-media-compressor-sdk";
 
 const { blob, timestampSeconds } = await extractThumbnail(file, "balanced");
 // Or pass a quality string: 'performance' | 'balanced' | 'quality' | 'best-quality'
@@ -71,7 +71,7 @@ The thumbnail pipeline does a **coarse scan + two frame-accurate refinement pass
 ### Compress images (including iPhone HEIC)
 
 ```ts
-import { compressImage } from "@mdslabs/webcodecs-mp4";
+import { compressImage } from "@mdslabs/wc-media-compressor-sdk";
 
 const out = await compressImage(file, {
   outputFormats: ["jpeg", "webp"],
@@ -85,7 +85,7 @@ const out = await compressImage(file, {
 For batch compression:
 
 ```ts
-import { compressImages } from "@mdslabs/webcodecs-mp4";
+import { compressImages } from "@mdslabs/wc-media-compressor-sdk";
 
 const results = await compressImages(
   files.map((file) => ({ file, options: { outputFormats: ["webp"] } })),
