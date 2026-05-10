@@ -21,6 +21,7 @@ jobs:
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
+          scope: "@mdslabs"
           cache: "npm"
 
       - run: npm ci
@@ -32,6 +33,8 @@ jobs:
 
       - name: Check if version already exists on npm
         id: npm_version_check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           PACKAGE_NAME=$(node -p "require('./package.json').name")
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
@@ -42,9 +45,37 @@ jobs:
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - run: npm run prepublishOnly
-
-      - run: npm publish --access public
+      - name: Validate npm auth and scope access
         if: steps.npm_version_check.outputs.already_published != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          NPM_USER=$(npm whoami)
+          echo "Authenticated to npm as: ${NPM_USER}"
+
+          if [[ "$PACKAGE_NAME" == @*/* ]]; then
+            PACKAGE_SCOPE="${PACKAGE_NAME%%/*}"
+            PACKAGE_SCOPE="${PACKAGE_SCOPE#@}"
+
+            if [[ "$PACKAGE_SCOPE" != "$NPM_USER" ]]; then
+              echo "::warning::Package scope @$PACKAGE_SCOPE differs from npm user $NPM_USER."
+              echo "::warning::Ensure the token belongs to an npm account with publish rights on @$PACKAGE_SCOPE (org member/team permission)."
+            fi
+          fi
+
+      - run: npm run prepublishOnly
+
+      - name: Publish to npm
+        if: steps.npm_version_check.outputs.already_published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! npm publish --access public; then
+            PACKAGE_NAME=$(node -p "require('./package.json').name")
+            echo "::error::npm publish failed for ${PACKAGE_NAME}."
+            echo "::error::If the error is E404 for a scoped package, the npm token usually lacks publish access to that scope or the scope/org does not exist."
+            exit 1
+          fi
