@@ -1,0 +1,76 @@
+{
+  "name": "@mdslabs/webcodecs-mp4",
+  "version": "0.1.0",
+  "description": "In-browser MP4 compression, best-frame thumbnail extraction, and image compression via WebCodecs — no server, no WASM runtime.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xxGreyscale/webcodecs-mp4.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "webcodecs",
+    "mp4",
+    "video",
+    "compression",
+    "compress",
+    "thumbnail",
+    "image",
+    "heic",
+    "client-side",
+    "browser",
+    "no-ffmpeg",
+    "no-wasm"
+  ],
+  "author": "mdslabs",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/xxGreyscale/webcodecs-mp4/issues"
+  },
+  "homepage": "https://github.com/xxGreyscale/webcodecs-mp4#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run clean && tsup && tsc",
+    "dev": "vite",
+    "demo:build": "vite build",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run build && npm run pack:check",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.59.2",
+    "@typescript-eslint/parser": "^8.59.2",
+    "eslint": "^10.3.0",
+    "globals": "^17.6.0",
+    "husky": "^9.1.7",
+    "mp4box": "^0.5.2",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0"
+  }
+}
