@@ -1,4 +1,4 @@
-# @mdslabs/webcodecs-media-compressor
+# @mdslabs/wc-media-compressor-sdk
 
 In-browser **MP4 video compression**, **best-frame thumbnail extraction**, and **image compression** powered by the WebCodecs API.
 
@@ -12,9 +12,9 @@ npm install @mdslabs/wc-media-compressor-sdk
 
 ## Why
 
-This SDK uses the browser's native **WebCodecs API** instead — hardware-accelerated encode/decode, no WASM, no worker bootstrap.
+This SDK uses the browser's native **WebCodecs API** — hardware-accelerated encode/decode, no WASM bootstrap, no worker pool to spin up.
 
-- **Tiny runtime** — ~300 KB minified (mp4box bundled in)
+- **Tiny runtime** — ~310 KB minified (mp4box bundled in; oxipng WASM lazy-loaded only when PNG output is requested)
 - **Hardware-accelerated** — `VideoEncoder` / `VideoDecoder` use the device GPU/VPU when available
 - **Framework-agnostic** — three plain async functions, no React/Vue/Svelte coupling
 - **ESM + CJS** — works in modern bundlers and Node-based tooling
@@ -33,7 +33,7 @@ This SDK uses the browser's native **WebCodecs API** instead — hardware-accele
 ² Falls back to a `<video>`-only pipeline (keyframe-accurate, not frame-accurate).
 ³ HEIC requires `ImageDecoder`, which Firefox does not implement.
 
-Output is always **H.264 MP4** (`avc1.4d001f` — Main Profile, Level 3.1).
+Video output is always **H.264 MP4**. The encoder picks the lowest H.264 level that fits the input resolution and framerate (Level 3.0 → 5.2), so 720p / 1080p / 4K all work as-is.
 
 ---
 
@@ -74,12 +74,12 @@ The thumbnail pipeline does a **coarse scan + two frame-accurate refinement pass
 import { compressImage } from "@mdslabs/wc-media-compressor-sdk";
 
 const out = await compressImage(file, {
-  outputFormats: ["jpeg", "webp"],
-  quality: 0.82,
+  outputFormats: ["jpeg", "webp", "png"],
+  preset: "balanced", // or 'lossless' | 'high' | 'small' | 'tiny'
   maxWidth: 2048,
 });
 
-// out is keyed by format: out.jpeg, out.webp — each is a File
+// out is keyed by format: out.jpeg, out.webp, out.png — each is a File
 ```
 
 For batch compression:
@@ -147,9 +147,14 @@ Falls back to a pure `<video>`-element pipeline if the file isn't a parseable MP
 ### `compressImage(file, options?, onProgress?) => Promise<CompressedImageOutput>`
 
 ```ts
+type ImageOutputFormat = "jpeg" | "webp" | "png";
+type ImageCompressionPreset = "lossless" | "high" | "balanced" | "small" | "tiny";
+
 interface ImageCompressionOptions {
-  outputFormats?: ("jpeg" | "webp" | "png")[]; // default: ['jpeg']
-  quality?: number; // 0–1, default 0.82
+  outputFormats?: ImageOutputFormat[]; // default: ['webp']
+  preset?: ImageCompressionPreset; // default: 'balanced'
+  quality?: number; // 0–1, overrides preset for JPEG/WebP
+  pngPreset?: ImageCompressionPreset; // override PNG-specific behaviour
   targetSizeKB?: number; // binary-search quality to fit
   maxWidth?: number;
   maxHeight?: number;
@@ -158,12 +163,41 @@ interface ImageCompressionOptions {
   outputFileName?: string;
 }
 
-type CompressedImageOutput = Record<string, File>; // keyed by format
+type CompressedImageOutput = Record<ImageOutputFormat, File>;
 ```
+
+**Preset → format behaviour:**
+
+| Preset      | JPEG / WebP `quality` | PNG behaviour                            |
+| ----------- | --------------------- | ---------------------------------------- |
+| `lossless`  | 1.0                   | True lossless PNG-24/32 + oxipng         |
+| `high`      | 0.90                  | PNG-24, mild WebP precondition           |
+| `balanced`  | 0.80                  | **PNG-8 palette** (256 adaptive colours) |
+| `small`     | 0.60                  | **PNG-8 palette** (128 colours)          |
+| `tiny`      | 0.40                  | **PNG-8 palette** (32 colours)           |
+
+If you pass `quality` directly it overrides the preset for JPEG/WebP and is bucketed into the equivalent PNG mode (≥ 0.95 → `lossless`, ≥ 0.85 → `high`, ≥ 0.70 → `balanced`, ≥ 0.50 → `small`, else `tiny`).
 
 ### `compressImages(items, maxConcurrency?) => Promise<BatchImageCompressionResult[]>`
 
 Same as `compressImage`, but parallel and never throws — errors are captured per item.
+
+---
+
+## PNG behaviour
+
+PNG is fundamentally a lossless format — `canvas.toBlob` ignores its quality argument. Naively re-encoding a photo as PNG balloons the output to 5–15× the source. To make PNG output actually useful the SDK runs a four-stage pipeline:
+
+1. **WebP precondition** — round-trip the canvas through WebP at the preset's quality to strip photographic noise. Alpha is preserved (WebP supports it). Skipped for `lossless`.
+2. **Adaptive palette quantisation** — for `balanced` and below, a median-cut quantiser (the same algorithm `pngquant` uses) reduces the image to N adaptive colours. The palette tracks the image's actual colour distribution, so quality at 256 colours is far better than uniform posterisation.
+3. **PNG encode** — the browser writes a standard PNG via `canvas.toBlob`. With ≤ 256 unique colours, oxipng will convert this to **PNG-8 palette mode** automatically.
+4. **oxipng optimisation** — runs as WebAssembly (loaded on demand, ~160 KB single-thread build). Picks the best DEFLATE filter combination and re-packs the file. Always lossless at this step.
+
+**Inflation guard.** If the compressed output happens to be ≥ the original (common for already-optimised graphics, screenshots, icons), the SDK returns the **original file unchanged** under the requested output name. Only triggers when the output format matches the input format and the caller didn't request a resize.
+
+**Alpha is preserved** through every preset. PNG-8 palette mode supports per-entry alpha via the `tRNS` chunk, so even `tiny` keeps transparent regions transparent. Smooth alpha gradients block oxipng's palette conversion (it requires ≤ 256 unique RGBA tuples), so the output stays as a quantised PNG-24 in those cases — still smaller than the original, just not palette-tiny.
+
+---
 
 ## License
 
