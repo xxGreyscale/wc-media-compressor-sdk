@@ -23,8 +23,17 @@ export async function encodeVideo(
   let avcDecoderConfig: ArrayBuffer | undefined;
   let encoderError: Error | undefined;
 
+  const codec = await pickSupportedH264Codec(width, height, track.fps, options.targetBitrate);
+  if (!codec) {
+    throw new Error(
+      `VideoEncoder cannot encode ${width}x${height} @ ${track.fps.toFixed(1)}fps ` +
+        `at ${options.targetBitrate} bps. The resolution/framerate combination exceeds ` +
+        `every H.264 level the browser supports — try reducing maxWidth.`,
+    );
+  }
+
   const encoderConfig: VideoEncoderConfig = {
-    codec: 'avc1.4d001f', // H.264 Main Profile Level 3.1
+    codec,
     width,
     height,
     bitrate: options.targetBitrate,
@@ -35,18 +44,18 @@ export async function encodeVideo(
 
   const encoder = new VideoEncoder({
     output: (chunk, metadata) => {
-      if (metadata?.decoderConfig?.description) {
-        avcDecoderConfig = metadata.decoderConfig.description as ArrayBuffer;
+      if (metadata?.decoderConfig?.description && !avcDecoderConfig) {
+        // `description` is spec'd as BufferSource — Chrome returns Uint8Array,
+        // others might return ArrayBuffer. Normalise to a tightly-sized
+        // ArrayBuffer so mp4box reads exactly the AVCDecoderConfigurationRecord
+        // bytes and nothing else.
+        avcDecoderConfig = toArrayBuffer(metadata.decoderConfig.description);
       }
       chunks.push({ chunk, isKey: chunk.type === 'key' });
     },
     error: (e) => { encoderError = e; },
   });
 
-  const support = await VideoEncoder.isConfigSupported(encoderConfig);
-  if (!support.supported) {
-    throw new Error(`VideoEncoder does not support config: ${JSON.stringify(encoderConfig)}`);
-  }
   encoder.configure(encoderConfig);
 
   const decoder = new VideoDecoder({
@@ -129,4 +138,72 @@ function resolveOutputDimensions(
 
 function yieldMicrotask(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
+}
+
+/**
+ * Copies a BufferSource into a fresh, tightly-sized ArrayBuffer. The encoder's
+ * `decoderConfig.description` is typed as BufferSource — in practice Chrome
+ * returns a Uint8Array view whose `.buffer` may be larger than the actual bytes.
+ * Reading the underlying buffer directly would feed mp4box garbage tail bytes.
+ */
+function toArrayBuffer(src: AllowSharedBufferSource): ArrayBuffer {
+  const view: Uint8Array =
+    src instanceof ArrayBuffer
+      ? new Uint8Array(src)
+      : ArrayBuffer.isView(src)
+        ? new Uint8Array(src.buffer as ArrayBuffer, src.byteOffset, src.byteLength)
+        : new Uint8Array(src as ArrayBufferLike);
+  const out = new ArrayBuffer(view.byteLength);
+  new Uint8Array(out).set(view);
+  return out;
+}
+
+/**
+ * Probes H.264 Main Profile levels from lowest viable to highest and returns
+ * the first codec string the browser's VideoEncoder will accept. The level is
+ * selected from the spec's per-level limits on macroblocks-per-frame and
+ * macroblocks-per-second — hardcoding any single level would either reject
+ * 1080p+ inputs (level 3.1 caps at 720p) or fail to hardware-accelerate on
+ * mobile (where higher levels often lack HW support).
+ *
+ * Returns null if no level supports the given resolution/framerate.
+ */
+async function pickSupportedH264Codec(
+  width: number,
+  height: number,
+  fps: number,
+  bitrate: number,
+): Promise<string | null> {
+  const mbsPerFrame = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const mbsPerSecond = mbsPerFrame * Math.max(1, fps);
+
+  // [codec-suffix, maxFS (macroblocks per frame), maxMBPS (macroblocks per second)]
+  const levels: Array<[string, number, number]> = [
+    ['1e', 1620, 40500],     // 3.0  — 720x480 @30
+    ['1f', 3600, 108000],    // 3.1  — 1280x720 @30
+    ['20', 5120, 216000],    // 3.2
+    ['28', 8192, 245760],    // 4.0  — 1920x1080 @30
+    ['29', 8192, 245760],    // 4.1
+    ['2a', 8704, 522240],    // 4.2  — 1920x1080 @60
+    ['32', 22080, 589824],   // 5.0
+    ['33', 36864, 983040],   // 5.1  — 4K @30
+    ['34', 36864, 2073600],  // 5.2  — 4K @60
+  ];
+
+  for (const [suffix, maxFS, maxMBPS] of levels) {
+    if (mbsPerFrame > maxFS || mbsPerSecond > maxMBPS) continue;
+    const codec = `avc1.4d00${suffix}`;
+    const probe = await VideoEncoder.isConfigSupported({
+      codec,
+      width,
+      height,
+      bitrate,
+      framerate: fps,
+      hardwareAcceleration: 'prefer-hardware',
+      avc: { format: 'avc' },
+    });
+    if (probe.supported) return codec;
+  }
+
+  return null;
 }
