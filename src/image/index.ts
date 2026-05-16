@@ -4,7 +4,7 @@ import type {
   BatchImageCompressionItem,
   BatchImageCompressionResult,
 } from "./types";
-import { DEFAULT_IMAGE_OUTPUT_FORMATS, DEFAULT_IMAGE_QUALITY } from "./constants";
+import { DEFAULT_IMAGE_OUTPUT_FORMATS, DEFAULT_IMAGE_PRESET } from "./constants";
 import { isHeicFile, getBaseName } from "./utils";
 import { compressWithCanvas } from "./canvas-compress";
 import { compressWithImageDecoder } from "./imagedecoder-compress";
@@ -16,12 +16,13 @@ export type {
   BatchImageCompressionItem,
   BatchImageCompressionResult,
   ImageOutputFormat,
+  ImageCompressionPreset,
 } from "./types";
 
 function resolveOptions(options?: ImageCompressionOptions): ImageCompressionOptions {
   return {
     outputFormats: DEFAULT_IMAGE_OUTPUT_FORMATS,
-    quality: DEFAULT_IMAGE_QUALITY,
+    preset: DEFAULT_IMAGE_PRESET,
     ...options,
   };
 }

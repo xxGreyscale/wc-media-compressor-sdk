@@ -1,7 +1,19 @@
-import type { ImageOutputFormat } from "./types";
+import type { ImageOutputFormat, ImageCompressionPreset } from "./types";
 
 export const DEFAULT_IMAGE_OUTPUT_FORMATS: ImageOutputFormat[] = ["webp"];
-export const DEFAULT_IMAGE_QUALITY = 0.82;
+export const DEFAULT_IMAGE_PRESET: ImageCompressionPreset = "balanced";
+
+/** Quality value passed to JPEG/WebP encoders for each preset. */
+export const PRESET_QUALITY: Record<ImageCompressionPreset, number> = {
+  lossless: 1.0,
+  high: 0.9,
+  balanced: 0.8,
+  small: 0.6,
+  tiny: 0.4,
+};
+
+/** Legacy default — derived from `balanced`. Kept for backwards compatibility. */
+export const DEFAULT_IMAGE_QUALITY = PRESET_QUALITY.balanced;
 
 export const IMAGE_MIME_TYPES: Record<ImageOutputFormat, string> = {
   jpeg: "image/jpeg",
@@ -23,7 +35,5 @@ export const HEIC_MIME_TYPES = [
 ] as const;
 
 export const HEIC_EXTENSIONS = [".heic", ".heif", ".heics", ".heix"] as const;
-
-export const LOSSLESS_FORMATS: ImageOutputFormat[] = ["png"];
 
 export const TARGET_SIZE_SEARCH_ITERATIONS = 10;

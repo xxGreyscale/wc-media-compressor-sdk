@@ -47,9 +47,9 @@ export async function compressWithImageDecoder(
     canvas.width = w;
     canvas.height = h;
 
-    const ctx = canvas.getContext("2d", { alpha: false })!;
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, w, h);
+    // Default `alpha: true` — HEIC files can carry alpha (rarely, but they can)
+    // and we want transparency to survive into PNG/WebP outputs.
+    const ctx = canvas.getContext("2d")!;
     ctx.drawImage(frame, 0, 0, w, h);
 
     return compressFromCanvas(canvas, options, outputFileName, onProgress);

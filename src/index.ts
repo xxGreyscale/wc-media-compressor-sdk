@@ -19,6 +19,7 @@ export type {
 export { compressImage, compressImages } from './image/index';
 export type {
   ImageCompressionOptions,
+  ImageCompressionPreset,
   CompressedImageOutput,
   ImageOutputFormat,
   BatchImageCompressionItem,
