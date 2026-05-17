@@ -1,9 +1,10 @@
 // Video compression
-export { compressVideo } from './video/index';
+export { compressVideo, probeVideo } from './video/index';
 export type {
   VideoCompressionOptions,
   VideoCompressionResult,
   VideoCompressionProgressCallback,
+  VideoMetadata,
 } from './video/types';
 
 // Thumbnail extraction

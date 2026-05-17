@@ -52,7 +52,12 @@ export async function compressWithImageDecoder(
     const ctx = canvas.getContext("2d")!;
     ctx.drawImage(frame, 0, 0, w, h);
 
-    return compressFromCanvas(canvas, options, outputFileName, onProgress);
+    try {
+      return await compressFromCanvas(canvas, options, outputFileName, onProgress);
+    } finally {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   } finally {
     frame?.close();
     decoder.close();

@@ -1,7 +1,7 @@
 {
   "name": "@mdslabs/wc-media-compressor-sdk",
-  "version": "0.1.0",
-  "description": "In-browser MP4 compression, best-frame thumbnail extraction, and image compression via WebCodecs — no server, no WASM runtime.",
+  "version": "0.2.0",
+  "description": "In-browser MP4 video compression, image compression (JPEG/PNG/WebP/HEIC), and best-frame thumbnail extraction via WebCodecs — no server, no FFmpeg WASM.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/xxGreyscale/wc-media-compressor-sdk.git"
@@ -29,16 +29,18 @@
   "keywords": [
     "webcodecs",
     "mp4",
-    "video",
-    "compression",
-    "compress",
+    "h264",
+    "hevc",
+    "video-compression",
+    "image-compression",
     "thumbnail",
-    "image",
     "heic",
+    "png",
+    "jpeg",
+    "webp",
     "client-side",
     "browser",
-    "no-ffmpeg",
-    "no-wasm"
+    "no-ffmpeg"
   ],
   "author": "mdslabs",
   "license": "MIT",
@@ -71,6 +73,8 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
-    "@jsquash/oxipng": "^2.3.0"
+    "@jsquash/oxipng": "^2.3.0",
+    "@yume-chan/libde265": "^1.0.0",
+    "libheif-js": "^1.19.8"
   }
 }

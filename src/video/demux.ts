@@ -112,20 +112,21 @@ export function demux(file: File): Promise<DemuxResult> {
 }
 
 /**
- * Extracts the AVCDecoderConfigurationRecord (avcC box body) for H.264 tracks.
- * VideoDecoder needs this as its `description` to decode AVCC-format samples.
+ * Extracts the decoder configuration record for the video track. Handles both
+ * AVCDecoderConfigurationRecord (H.264 `avcC` box) and HEVCDecoderConfigurationRecord
+ * (`hvcC` / `hev1C` for HEVC). Returned without the 8-byte box header.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractVideoDescription(mp4file: any, trackId: number): Uint8Array | undefined {
   try {
     const trak = mp4file.getTrackById(trackId);
-    const avcC = trak?.mdia?.minf?.stbl?.stsd?.entries?.[0]?.avcC;
-    if (!avcC) return undefined;
+    const entry = trak?.mdia?.minf?.stbl?.stsd?.entries?.[0];
+    const configBox = entry?.avcC ?? entry?.hvcC ?? entry?.hev1C;
+    if (!configBox) return undefined;
 
-    // Serialize the box and strip the 8-byte header (4 size + 4 type)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const stream = new (MP4Box as any).DataStream(undefined, 0, (MP4Box as any).DataStream.BIG_ENDIAN);
-    avcC.write(stream);
+    configBox.write(stream);
     return new Uint8Array(stream.buffer, 8);
   } catch {
     return undefined;

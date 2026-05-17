@@ -12,7 +12,7 @@ import {
   DEFAULT_IMAGE_PRESET,
 } from "./constants";
 import { computeOutputDimensions } from "./utils";
-import { optimisePng } from "./png-optimise";
+import { encodePngFromCanvas } from "./png-optimise";
 import { medianCutQuantize } from "./palette-quantize";
 
 function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality: number): Promise<Blob> {
@@ -29,36 +29,46 @@ function canvasToBlob(canvas: HTMLCanvasElement, mimeType: string, quality: numb
 }
 
 interface PngMode {
-  /** WebP precondition quality. null = skip precondition (true lossless). */
-  webpQuality: number | null;
-  /** Median-cut palette target color count. null = skip palette quantization. */
+  /**
+   * Median-cut palette target colour count. `null` = skip palette quantisation
+   * entirely (PNG-24 output, fully lossless within the dimension cap).
+   */
   paletteColors: number | null;
+  /**
+   * Cap on the longer side (width or height, whichever is larger) of the PNG
+   * canvas. `Infinity` = no cap. Aspect ratio is preserved; the SDK never
+   * upscales. PNG-only — sibling JPEG/WebP outputs keep their original
+   * dimensions.
+   */
+  maxLongerSide: number;
 }
 
 /**
- * Discrete PNG modes. Each preset maps 1:1 here. PNG has no continuous quality
- * dial of its own — these are the operational modes the format can actually
- * deliver.
+ * Discrete PNG modes. Each cross-format preset maps 1:1 here.
  *
- *  - `lossless` keeps every pixel. Size depends entirely on input content.
- *  - `high` does a mild WebP precondition to strip sensor noise. Stays PNG-24.
- *  - `balanced` quantizes to a 256-colour adaptive palette via median-cut.
- *    Output is PNG-8 → typically 10–15× smaller than `lossless`. Quality is
- *    excellent on photos because the palette adapts to the image content.
- *  - `small` quantizes to 128 colours. Subtle banding on smooth gradients.
- *  - `tiny` quantizes to 32 colours. Heavy banding, smallest output.
+ * The strategy is "shrink dimensions first, then preserve as much quality as
+ * possible at the smaller size." Dimension reduction is the dominant size
+ * lever, so the lower presets lean on it heavily; palette colour counts stay
+ * generous so the image at its new size still looks close to the original.
  *
- * Alpha is preserved through palette quantization (the algorithm only touches
- * RGB). Smooth alpha gradients prevent palette-mode encoding by oxipng, but
- * the quantized PNG-24 result is still much smaller than the unquantized
- * equivalent.
+ *  | Preset      | Longer side cap | Palette       | Output       |
+ *  |-------------|-----------------|---------------|--------------|
+ *  | `lossless`  | ∞ (original)    | none          | PNG-24/32    |
+ *  | `high`      | 1080 px         | none          | PNG-24/32    |
+ *  | `balanced`  | 720 px          | 256 adaptive  | PNG-8 palette |
+ *  | `small`     | 480 px          | 256 adaptive  | PNG-8 palette |
+ *  | `tiny`      | 240 px          | 128 adaptive  | PNG-8 palette |
+ *
+ * The pipeline (per `encodePng`): scale → OKLab median-cut + k-means + dither
+ * → oxipng raw-pixel encode at level 6. No WebP precondition — dithering plus
+ * a generous palette gives better perceived quality than smoothing-first.
  */
 const PNG_MODES: Record<ImageCompressionPreset, PngMode> = {
-  lossless: { webpQuality: null, paletteColors: null },
-  high: { webpQuality: 0.9, paletteColors: null },
-  balanced: { webpQuality: 0.7, paletteColors: 256 },
-  small: { webpQuality: 0.5, paletteColors: 128 },
-  tiny: { webpQuality: 0.3, paletteColors: 32 },
+  lossless: { paletteColors: null, maxLongerSide: Infinity },
+  high: { paletteColors: null, maxLongerSide: 1080 },
+  balanced: { paletteColors: 256, maxLongerSide: 720 },
+  small: { paletteColors: 256, maxLongerSide: 480 },
+  tiny: { paletteColors: 128, maxLongerSide: 240 },
 };
 
 /** Bucket a continuous quality value to the matching PNG mode. */
@@ -75,32 +85,72 @@ function resolvePngMode(options: ImageCompressionOptions, quality: number): PngM
   return PNG_MODES[qualityToPngPreset(quality)];
 }
 
-async function preconditionViaWebP(
-  canvas: HTMLCanvasElement,
-  webpQuality: number,
-): Promise<HTMLCanvasElement> {
-  const webp = await canvasToBlob(canvas, "image/webp", webpQuality);
-  const bitmap = await createImageBitmap(webp);
-  try {
-    const tmp = document.createElement("canvas");
-    tmp.width = bitmap.width;
-    tmp.height = bitmap.height;
-    // Default `alpha: true` — preserves transparency from the source canvas.
-    tmp.getContext("2d")!.drawImage(bitmap, 0, 0);
-    return tmp;
-  } finally {
-    bitmap.close();
+async function encodePng(canvas: HTMLCanvasElement, mode: PngMode): Promise<Blob> {
+  // 1. Cap the longer side per the preset. Done first — every subsequent step
+  //    gets cheaper on a smaller canvas. Never upscales.
+  const scaled = fitToMaxLongerSide(canvas, mode.maxLongerSide) ?? canvas;
+
+  // 2. Optional adaptive palette quantisation (OKLab median-cut + k-means +
+  //    Floyd–Steinberg dither). Skipped at `lossless` / `high`.
+  if (mode.paletteColors !== null) {
+    medianCutQuantize(scaled, mode.paletteColors);
   }
+
+  // 3. oxipng writes the final PNG from raw pixels at level 6 with alpha
+  //    optimisation — palette-mode conversion lands automatically when the
+  //    canvas now has ≤ 256 unique RGBA tuples.
+  const blob = await encodePngFromCanvas(scaled);
+
+  if (scaled !== canvas) releaseCanvas(scaled);
+  return blob;
 }
 
-async function encodePng(canvas: HTMLCanvasElement, mode: PngMode): Promise<Blob> {
-  const preconditioned =
-    mode.webpQuality !== null ? await preconditionViaWebP(canvas, mode.webpQuality) : canvas;
-  if (mode.paletteColors !== null) {
-    medianCutQuantize(preconditioned, mode.paletteColors);
+/**
+ * Scales the canvas so its longer side ≤ `maxLongerSide`, **strictly preserving
+ * aspect ratio**. Returns null when no scaling is needed (input already fits,
+ * or cap is Infinity) — the caller reuses the original canvas in that case.
+ *
+ * Aspect ratio guarantee: a single `scale` factor is derived from the longer
+ * side and applied to both dimensions. The longer side becomes exactly
+ * `maxLongerSide` (no rounding — it's a direct assignment); the shorter side
+ * is derived from the original ratio. This means the output ratio is exactly
+ * `srcW / srcH` up to sub-pixel rounding (max ½-pixel error on the short side
+ * for non-standard input dimensions).
+ *
+ * If the shorter side would round to zero (extreme panoramic input vs. a tiny
+ * cap), it's clamped to 1 — the aspect-ratio invariant breaks here, but the
+ * alternative is an unusable zero-height canvas. This case is unreachable for
+ * any reasonable photo input.
+ */
+function fitToMaxLongerSide(
+  canvas: HTMLCanvasElement,
+  maxLongerSide: number,
+): HTMLCanvasElement | null {
+  if (!isFinite(maxLongerSide)) return null;
+  const srcW = canvas.width;
+  const srcH = canvas.height;
+  const longest = Math.max(srcW, srcH);
+  if (longest <= maxLongerSide) return null;
+
+  let w: number;
+  let h: number;
+  if (srcW >= srcH) {
+    // Landscape / square. Width is the longer side and pins to the cap exactly.
+    w = maxLongerSide;
+    h = Math.max(1, Math.round((maxLongerSide * srcH) / srcW));
+  } else {
+    // Portrait. Height is the longer side.
+    h = maxLongerSide;
+    w = Math.max(1, Math.round((maxLongerSide * srcW) / srcH));
   }
-  const raw = await canvasToBlob(preconditioned, "image/png", 1);
-  return optimisePng(raw);
+
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  // Browser bilinear/bicubic resampling. Cheap and good enough — the next
+  // pipeline steps quantize colours anyway.
+  out.getContext("2d")!.drawImage(canvas, 0, 0, w, h);
+  return out;
 }
 
 async function encodeJpeg(canvas: HTMLCanvasElement, quality: number): Promise<Blob> {
@@ -113,7 +163,14 @@ async function encodeJpeg(canvas: HTMLCanvasElement, quality: number): Promise<B
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, flat.width, flat.height);
   ctx.drawImage(canvas, 0, 0);
-  return canvasToBlob(flat, "image/jpeg", quality);
+  const blob = await canvasToBlob(flat, "image/jpeg", quality);
+  releaseCanvas(flat);
+  return blob;
+}
+
+function releaseCanvas(canvas: HTMLCanvasElement): void {
+  canvas.width = 0;
+  canvas.height = 0;
 }
 
 async function encodeToBlob(
@@ -221,5 +278,9 @@ export async function compressWithCanvas(
   ctx.drawImage(bitmap, 0, 0, w, h);
   bitmap.close();
 
-  return compressFromCanvas(canvas, options, outputFileName, onProgress);
+  try {
+    return await compressFromCanvas(canvas, options, outputFileName, onProgress);
+  } finally {
+    releaseCanvas(canvas);
+  }
 }

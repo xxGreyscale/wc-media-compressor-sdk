@@ -1,4 +1,6 @@
 import type { VideoTrackInfo, VideoCompressionOptions, EncodedVideoChunk_ } from './types';
+import { parseHvcC, isMain10, splitAvccSample } from './hvcc';
+import { HevcDecoderClient } from './hevc-decoder';
 
 const BACKPRESSURE_LIMIT = 10;
 
@@ -19,14 +21,21 @@ export async function encodeVideo(
   const { width, height } = resolveOutputDimensions(track, options.maxWidth);
   const needsResize = width !== track.width || height !== track.height;
 
+  // Output framerate: capped to `maxFps` but never higher than the source.
+  // Used both as a hint to the encoder (rate control) and as a target the
+  // decoder-output loop drops frames against.
+  const outputFps =
+    options.maxFps !== undefined ? Math.min(options.maxFps, track.fps) : track.fps;
+  const minFrameIntervalUs = outputFps < track.fps ? 1_000_000 / outputFps : 0;
+
   const chunks: EncodedVideoChunk_[] = [];
   let avcDecoderConfig: ArrayBuffer | undefined;
   let encoderError: Error | undefined;
 
-  const codec = await pickSupportedH264Codec(width, height, track.fps, options.targetBitrate);
+  const codec = await pickSupportedH264Codec(width, height, outputFps, options.targetBitrate);
   if (!codec) {
     throw new Error(
-      `VideoEncoder cannot encode ${width}x${height} @ ${track.fps.toFixed(1)}fps ` +
+      `VideoEncoder cannot encode ${width}x${height} @ ${outputFps.toFixed(1)}fps ` +
         `at ${options.targetBitrate} bps. The resolution/framerate combination exceeds ` +
         `every H.264 level the browser supports — try reducing maxWidth.`,
     );
@@ -37,18 +46,14 @@ export async function encodeVideo(
     width,
     height,
     bitrate: options.targetBitrate,
-    framerate: track.fps,
+    framerate: outputFps,
     hardwareAcceleration: 'prefer-hardware',
-    avc: { format: 'avc' }, // AVCC output (length-prefixed), not Annex B
+    avc: { format: 'avc' },
   };
 
   const encoder = new VideoEncoder({
     output: (chunk, metadata) => {
       if (metadata?.decoderConfig?.description && !avcDecoderConfig) {
-        // `description` is spec'd as BufferSource — Chrome returns Uint8Array,
-        // others might return ArrayBuffer. Normalise to a tightly-sized
-        // ArrayBuffer so mp4box reads exactly the AVCDecoderConfigurationRecord
-        // bytes and nothing else.
         avcDecoderConfig = toArrayBuffer(metadata.decoderConfig.description);
       }
       chunks.push({ chunk, isKey: chunk.type === 'key' });
@@ -58,25 +63,90 @@ export async function encodeVideo(
 
   encoder.configure(encoderConfig);
 
+  // Per-frame handler: optional fps cap, optional resize, then encode.
+  // Used by both the WebCodecs VideoDecoder path (H.264) and the libde265
+  // worker path (HEVC) — both end up handing the encoder a VideoFrame.
+  //
+  // The fps cap is applied by dropping frames whose timestamp arrives before
+  // the next target time. `nextEmitTargetUs` advances by `minFrameIntervalUs`
+  // per emit, so the average output rate converges to exactly `outputFps`
+  // regardless of source jitter.
+  let nextEmitTargetUs = 0;
+  let firstFrameEmitted = false;
+  const handleFrame = (frame: VideoFrame): void => {
+    if (encoderError) { frame.close(); return; }
+
+    if (minFrameIntervalUs > 0) {
+      if (!firstFrameEmitted) {
+        firstFrameEmitted = true;
+        nextEmitTargetUs = frame.timestamp + minFrameIntervalUs;
+      } else if (frame.timestamp < nextEmitTargetUs) {
+        frame.close();
+        return;
+      } else {
+        nextEmitTargetUs += minFrameIntervalUs;
+      }
+    }
+
+    if (needsResize) {
+      const ts = frame.timestamp;
+      const dur = frame.duration ?? undefined;
+      const canvas = new OffscreenCanvas(width, height);
+      canvas.getContext('2d')!.drawImage(frame, 0, 0, width, height);
+      frame.close();
+      const resized = new VideoFrame(canvas, { timestamp: ts, duration: dur });
+      encoder.encode(resized, { keyFrame: false });
+      resized.close();
+    } else {
+      encoder.encode(frame, { keyFrame: false });
+      frame.close();
+    }
+  };
+
+  const isHevc = track.codec.startsWith('hvc1') || track.codec.startsWith('hev1');
+
+  if (isHevc && !(await isVideoDecoderHevcSupported(track))) {
+    await decodeHevcViaLibde265(track, handleFrame, onProgress, () => encoderError);
+  } else {
+    await decodeViaVideoDecoder(track, handleFrame, onProgress, () => encoderError);
+  }
+
+  await encoder.flush();
+  encoder.close();
+
+  if (encoderError) throw encoderError;
+
+  return { chunks, avcDecoderConfig, width, height, timescale: 90000 };
+}
+
+async function isVideoDecoderHevcSupported(track: VideoTrackInfo): Promise<boolean> {
+  try {
+    const support = await VideoDecoder.isConfigSupported({
+      codec: track.codec,
+      codedWidth: track.width,
+      codedHeight: track.height,
+      ...(track.description ? { description: track.description } : {}),
+    });
+    return support.supported === true;
+  } catch {
+    return false;
+  }
+}
+
+async function decodeViaVideoDecoder(
+  track: VideoTrackInfo,
+  handleFrame: (frame: VideoFrame) => void,
+  onProgress: (percent: number) => void,
+  getEncoderError: () => Error | undefined,
+): Promise<void> {
+  let decoderError: Error | undefined;
+
   const decoder = new VideoDecoder({
     output: (frame) => {
-      if (encoderError) { frame.close(); return; }
-
-      if (needsResize) {
-        const ts = frame.timestamp;
-        const dur = frame.duration ?? undefined;
-        const canvas = new OffscreenCanvas(width, height);
-        canvas.getContext('2d')!.drawImage(frame, 0, 0, width, height);
-        frame.close();
-        const resized = new VideoFrame(canvas, { timestamp: ts, duration: dur });
-        encoder.encode(resized, { keyFrame: false });
-        resized.close();
-      } else {
-        encoder.encode(frame, { keyFrame: false });
-        frame.close();
-      }
+      if (getEncoderError() || decoderError) { frame.close(); return; }
+      handleFrame(frame);
     },
-    error: (e) => { encoderError = e; },
+    error: (e) => { decoderError = e; },
   });
 
   const decoderConfig: VideoDecoderConfig = {
@@ -88,15 +158,18 @@ export async function encodeVideo(
 
   const decoderSupport = await VideoDecoder.isConfigSupported(decoderConfig);
   if (!decoderSupport.supported) {
-    throw new Error(`VideoDecoder does not support codec: ${track.codec}`);
+    throw new Error(
+      `VideoDecoder does not support codec "${track.codec}" in this browser. ` +
+        `If this is an HEVC file on Chrome, the libde265 fallback should have been ` +
+        `selected automatically — please report this as a bug.`,
+    );
   }
   decoder.configure(decoderConfig);
 
   const total = track.samples.length;
   for (let i = 0; i < total; i++) {
-    if (encoderError) throw encoderError;
+    if (decoderError) throw decoderError;
 
-    // Backpressure: yield until the decoder queue drains
     while (decoder.decodeQueueSize > BACKPRESSURE_LIMIT) {
       await yieldMicrotask();
     }
@@ -113,14 +186,75 @@ export async function encodeVideo(
   }
 
   await decoder.flush();
-  await encoder.flush();
-
   decoder.close();
-  encoder.close();
 
-  if (encoderError) throw encoderError;
+  if (decoderError) throw decoderError;
+}
 
-  return { chunks, avcDecoderConfig, width, height, timescale: 90000 };
+async function decodeHevcViaLibde265(
+  track: VideoTrackInfo,
+  handleFrame: (frame: VideoFrame) => void,
+  onProgress: (percent: number) => void,
+  getEncoderError: () => Error | undefined,
+): Promise<void> {
+  if (!track.description) {
+    throw new Error('HEVC track has no hvcC configuration — input file is malformed.');
+  }
+
+  const info = parseHvcC(track.description);
+
+  if (isMain10(info)) {
+    throw new Error(
+      '10-bit HEVC (Main10 / HDR) is not supported by the libde265 fallback. ' +
+        'Re-export this clip in your camera settings to "Most Compatible" / 8-bit.',
+    );
+  }
+  if (info.chromaFormatIdc !== 1) {
+    throw new Error(
+      `Unsupported HEVC chroma format ${info.chromaFormatIdc} (only 4:2:0 is supported).`,
+    );
+  }
+  if (info.parameterSets.length === 0) {
+    throw new Error('HEVC hvcC contains no parameter sets (VPS/SPS/PPS).');
+  }
+
+  const client = new HevcDecoderClient();
+  try {
+    client.setOnFrame((yuv) => {
+      if (getEncoderError()) return;
+      const videoFrame = new VideoFrame(yuv.data, {
+        format: 'I420',
+        codedWidth: yuv.width,
+        codedHeight: yuv.height,
+        timestamp: Number(yuv.pts),
+      });
+      handleFrame(videoFrame);
+    });
+
+    await client.init(info.parameterSets);
+
+    const total = track.samples.length;
+    for (let i = 0; i < total; i++) {
+      if (getEncoderError()) break;
+
+      const s = track.samples[i];
+      const nals = splitAvccSample(s.data, info.lengthSize);
+      if (nals.length === 0) continue;
+
+      const ptsUs = BigInt(Math.round((s.cts / s.timescale) * 1_000_000));
+      client.feed(nals, ptsUs);
+
+      onProgress(Math.round(((i + 1) / total) * 100));
+
+      // Yield occasionally so the main thread can process worker messages
+      // (decoded frames) and feed them to the encoder.
+      if (i % 16 === 0) await yieldMicrotask();
+    }
+
+    await client.flush();
+  } finally {
+    client.close();
+  }
 }
 
 function resolveOutputDimensions(
@@ -131,7 +265,6 @@ function resolveOutputDimensions(
     return { width: track.width, height: track.height };
   }
   const ratio = maxWidth / track.width;
-  // Height must be even for H.264
   const height = Math.round(track.height * ratio / 2) * 2;
   return { width: maxWidth, height };
 }
@@ -140,12 +273,6 @@ function yieldMicrotask(): Promise<void> {
   return new Promise((r) => setTimeout(r, 0));
 }
 
-/**
- * Copies a BufferSource into a fresh, tightly-sized ArrayBuffer. The encoder's
- * `decoderConfig.description` is typed as BufferSource — in practice Chrome
- * returns a Uint8Array view whose `.buffer` may be larger than the actual bytes.
- * Reading the underlying buffer directly would feed mp4box garbage tail bytes.
- */
 function toArrayBuffer(src: AllowSharedBufferSource): ArrayBuffer {
   const view: Uint8Array =
     src instanceof ArrayBuffer
@@ -160,13 +287,8 @@ function toArrayBuffer(src: AllowSharedBufferSource): ArrayBuffer {
 
 /**
  * Probes H.264 Main Profile levels from lowest viable to highest and returns
- * the first codec string the browser's VideoEncoder will accept. The level is
- * selected from the spec's per-level limits on macroblocks-per-frame and
- * macroblocks-per-second — hardcoding any single level would either reject
- * 1080p+ inputs (level 3.1 caps at 720p) or fail to hardware-accelerate on
- * mobile (where higher levels often lack HW support).
- *
- * Returns null if no level supports the given resolution/framerate.
+ * the first codec string the browser's VideoEncoder will accept. Selecting
+ * the lowest viable level maximises hardware-acceleration coverage on mobile.
  */
 async function pickSupportedH264Codec(
   width: number,
@@ -177,17 +299,16 @@ async function pickSupportedH264Codec(
   const mbsPerFrame = Math.ceil(width / 16) * Math.ceil(height / 16);
   const mbsPerSecond = mbsPerFrame * Math.max(1, fps);
 
-  // [codec-suffix, maxFS (macroblocks per frame), maxMBPS (macroblocks per second)]
   const levels: Array<[string, number, number]> = [
-    ['1e', 1620, 40500],     // 3.0  — 720x480 @30
-    ['1f', 3600, 108000],    // 3.1  — 1280x720 @30
-    ['20', 5120, 216000],    // 3.2
-    ['28', 8192, 245760],    // 4.0  — 1920x1080 @30
-    ['29', 8192, 245760],    // 4.1
-    ['2a', 8704, 522240],    // 4.2  — 1920x1080 @60
-    ['32', 22080, 589824],   // 5.0
-    ['33', 36864, 983040],   // 5.1  — 4K @30
-    ['34', 36864, 2073600],  // 5.2  — 4K @60
+    ['1e', 1620, 40500],
+    ['1f', 3600, 108000],
+    ['20', 5120, 216000],
+    ['28', 8192, 245760],
+    ['29', 8192, 245760],
+    ['2a', 8704, 522240],
+    ['32', 22080, 589824],
+    ['33', 36864, 983040],
+    ['34', 36864, 2073600],
   ];
 
   for (const [suffix, maxFS, maxMBPS] of levels) {

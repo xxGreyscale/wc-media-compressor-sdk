@@ -19,7 +19,8 @@
     "src/thumbnail",
     "src/image",
     "src/shared",
-    "src/mp4box.d.ts"
+    "src/mp4box.d.ts",
+    "src/image/libheif.d.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

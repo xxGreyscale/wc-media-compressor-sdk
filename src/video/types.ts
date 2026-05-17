@@ -1,8 +1,47 @@
 export interface VideoCompressionOptions {
-  /** Target video bitrate in bits/second. */
+  /**
+   * Target video bitrate in bits/second. Automatically clamped to the source
+   * bitrate — passing a value higher than the source is meaningless (we
+   * can't add quality we never had) so the SDK uses the source instead.
+   */
   targetBitrate: number;
-  /** Optional max width — height is derived to keep aspect ratio. */
+  /**
+   * Optional max width — height is derived to keep aspect ratio. Clamped to
+   * the source width (we never upscale).
+   */
   maxWidth?: number;
+  /**
+   * Optional cap on the output frame rate. Frames are dropped from the encode
+   * pipeline so the output runs at ≤ `maxFps` frames per second. Clamped to
+   * the source fps (we never make up frames). Common value: `24` for typical
+   * phone footage.
+   */
+  maxFps?: number;
+}
+
+/**
+ * Metadata returned by `probeVideo()` — everything a UI needs to constrain
+ * the user's bitrate / resolution / framerate choices to values that make
+ * sense for the source.
+ */
+export interface VideoMetadata {
+  width: number;
+  height: number;
+  /** Average frame rate, derived from sample count ÷ duration. */
+  fps: number;
+  /**
+   * Approximate average bitrate in bits per second. Computed from the file's
+   * byte size and the video duration, so it includes the audio track and
+   * container overhead — usually within 5–10 % of the video-only bitrate.
+   */
+  bitrate: number;
+  durationSeconds: number;
+  /** Codec FourCC + profile string, e.g. `"avc1.640028"` or `"hvc1.1.6.L93.B0"`. */
+  codec: string;
+  hasAudio: boolean;
+  audioCodec?: string;
+  audioSampleRate?: number;
+  audioChannels?: number;
 }
 
 export interface VideoCompressionResult {

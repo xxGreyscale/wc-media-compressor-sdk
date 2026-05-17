@@ -1,8 +1,12 @@
 # @mdslabs/wc-media-compressor-sdk
 
-In-browser **MP4 video compression**, **best-frame thumbnail extraction**, and **image compression** powered by the WebCodecs API.
+[![npm version](https://img.shields.io/npm/v/@mdslabs/wc-media-compressor-sdk.svg)](https://www.npmjs.com/package/@mdslabs/wc-media-compressor-sdk)
+[![license: MIT](https://img.shields.io/npm/l/@mdslabs/wc-media-compressor-sdk.svg)](LICENSE)
+[![bundle size](https://img.shields.io/badge/bundle-~328%20KB-blue.svg)](#runtime-size)
 
-No server. No FFmpeg WASM runtime. No upload. The user's file never leaves their device.
+In-browser **MP4 video compression**, **image compression** (JPEG / PNG / WebP / HEIC), and **best-frame thumbnail extraction** powered by the browser's native WebCodecs API.
+
+No server. No 25 MB FFmpeg-WASM runtime. No upload. The user's file never leaves their device.
 
 ```bash
 npm install @mdslabs/wc-media-compressor-sdk
@@ -12,28 +16,28 @@ npm install @mdslabs/wc-media-compressor-sdk
 
 ## Why
 
-This SDK uses the browser's native **WebCodecs API** — hardware-accelerated encode/decode, no WASM bootstrap, no worker pool to spin up.
+Most "compress in the browser" libraries ship a multi-megabyte FFmpeg-WASM bundle, run on a single CPU thread, and chew battery. This SDK uses the browser's **WebCodecs API** instead — hardware-accelerated encode/decode, no WASM bootstrap, no worker pool to warm up.
 
-- **Tiny runtime** — ~310 KB minified (mp4box bundled in; oxipng WASM lazy-loaded only when PNG output is requested)
-- **Hardware-accelerated** — `VideoEncoder` / `VideoDecoder` use the device GPU/VPU when available
-- **Framework-agnostic** — three plain async functions, no React/Vue/Svelte coupling
-- **ESM + CJS** — works in modern bundlers and Node-based tooling
+- **Tiny runtime** — ~328 KB minified. Specialised WASM blobs (oxipng for PNG, libheif for HEIC on Firefox, libde265 for HEVC on Chrome) are **lazy-loaded only when their format is touched**.
+- **Hardware-accelerated** — `VideoEncoder` / `VideoDecoder` / `ImageDecoder` use the device GPU/VPU when available.
+- **Framework-agnostic** — three plain async functions. Works in any frontend stack.
+- **ESM + CJS** — modern bundlers (Vite, webpack 5, Rollup, Parcel) handle the lazy WASM imports automatically.
 
 ## Browser support
 
 | Feature                         | Chrome 94+ | Safari 16.4+ | Firefox |
 | ------------------------------- | :--------: | :----------: | :-----: |
-| `compressVideo` (H.264 in)      |     ✅     |      ✅      |   ❌    |
-| `compressVideo` (HEVC in)       |    ❌¹     |      ✅      |   ❌    |
+| `compressVideo` (H.264 input)   |     ✅     |      ✅      |   ❌    |
+| `compressVideo` (HEVC input)    |     ✅¹    |      ✅      |   ❌    |
 | `extractThumbnail`              |     ✅     |      ✅      |   ⚠️²   |
 | `compressImage` (JPEG/PNG/WebP) |     ✅     |      ✅      |   ✅    |
-| `compressImage` (HEIC/HEIF)     |     ✅     |      ✅      |   ❌³   |
+| `compressImage` (HEIC/HEIF)     |     ✅     |      ✅      |   ✅³   |
 
-¹ Chrome lacks an HEVC decode license — it throws on HEVC input. Re-export as H.264.
-² Falls back to a `<video>`-only pipeline (keyframe-accurate, not frame-accurate).
-³ HEIC requires `ImageDecoder`, which Firefox does not implement.
+¹ Lazy-loaded libde265 WASM worker (~410 KB). 10-bit HDR HEVC is rejected with a clear error.
+² Falls back to keyframe-accurate `<video>` seeking; refinement passes need WebCodecs.
+³ Lazy-loaded libheif WASM (~1.4 MB) is downloaded on first HEIC use only.
 
-Video output is always **H.264 MP4**. The encoder picks the lowest H.264 level that fits the input resolution and framerate (Level 3.0 → 5.2), so 720p / 1080p / 4K all work as-is.
+Video output is always **H.264 MP4** (the encoder picks the H.264 level dynamically — Level 3.0 through 5.2, so 720p, 1080p, and 4K all work).
 
 ---
 
@@ -42,20 +46,28 @@ Video output is always **H.264 MP4**. The encoder picks the lowest H.264 level t
 ### Compress a video
 
 ```ts
-import { compressVideo } from "@mdslabs/wc-media-compressor-sdk";
+import { compressVideo, probeVideo } from "@mdslabs/wc-media-compressor-sdk";
+
+// Optional: inspect the source first so you can constrain your compression
+// options against it (resolution / bitrate / fps you can't exceed).
+const meta = await probeVideo(file);
+// { width, height, fps, bitrate, durationSeconds, codec, hasAudio, ... }
 
 const result = await compressVideo(
-  file, // File from <input type="file">
-  { targetBitrate: 2_000_000, maxWidth: 1280 },
-  (phase, percent) => {
-    console.log(phase, percent); // 'decode' | 'encode' | 'mux'
+  file,                                        // File from <input type="file">
+  {
+    targetBitrate: 2_000_000,
+    maxWidth: 1280,
+    maxFps: 24,                                // drop high-fps source down to 24 fps
   },
+  (phase, percent) => console.log(phase, percent), // 'decode' | 'encode' | 'mux'
 );
 
 // result.blob — compressed MP4
-// result.originalBytes, result.compressedBytes, result.durationMs
-download(result.blob, "compressed.mp4");
+// result.originalBytes / result.compressedBytes / result.durationMs
 ```
+
+All options are automatically clamped against the source — `compressVideo` will never upscale dimensions, raise bitrate above the input, or invent frames. Use `probeVideo()` if you want your UI to *show* only valid choices.
 
 ### Extract the best-looking thumbnail
 
@@ -63,10 +75,10 @@ download(result.blob, "compressed.mp4");
 import { extractThumbnail } from "@mdslabs/wc-media-compressor-sdk";
 
 const { blob, timestampSeconds } = await extractThumbnail(file, "balanced");
-// Or pass a quality string: 'performance' | 'balanced' | 'quality' | 'best-quality'
+// quality: 'performance' | 'balanced' | 'quality' | 'best-quality'
 ```
 
-The thumbnail pipeline does a **coarse scan + two frame-accurate refinement passes** using `VideoDecoder`. It scores every candidate frame on sharpness (Tenengrad) and exposure, then picks the winner — no "first keyframe is good enough" guessing.
+The pipeline scans coarse timestamps via `<video>` seeking, then refines with frame-accurate `VideoDecoder` passes. Frames are scored on sharpness (Tenengrad gradient magnitude) and exposure.
 
 ### Compress images (including iPhone HEIC)
 
@@ -75,14 +87,13 @@ import { compressImage } from "@mdslabs/wc-media-compressor-sdk";
 
 const out = await compressImage(file, {
   outputFormats: ["jpeg", "webp", "png"],
-  preset: "balanced", // or 'lossless' | 'high' | 'small' | 'tiny'
-  maxWidth: 2048,
+  preset: "balanced", // 'lossless' | 'high' | 'balanced' | 'small' | 'tiny'
 });
 
-// out is keyed by format: out.jpeg, out.webp, out.png — each is a File
+// out.jpeg, out.webp, out.png — each is a File
 ```
 
-For batch compression:
+Batch:
 
 ```ts
 import { compressImages } from "@mdslabs/wc-media-compressor-sdk";
@@ -91,24 +102,24 @@ const results = await compressImages(
   files.map((file) => ({ file, options: { outputFormats: ["webp"] } })),
   5, // maxConcurrency
 );
-
-// results: { file, output?, error? }[] — never throws, errors are per-item
+// results: { file, output?, error? }[] — never throws, errors per-item
 ```
 
 ---
 
 ## API
 
-### `compressVideo(file, options, onProgress?) => Promise<VideoCompressionResult>`
+### `compressVideo(file, options, onProgress?)`
 
 ```ts
 interface VideoCompressionOptions {
-  targetBitrate: number; // bits/sec. e.g. 2_000_000 for 2 Mbps
-  maxWidth?: number; // optional cap — height derived from aspect ratio
+  targetBitrate: number; // bits/sec; clamped to source bitrate
+  maxWidth?: number;     // optional cap; clamped to source width, aspect ratio preserved
+  maxFps?: number;       // optional cap; clamped to source fps; frames dropped to fit
 }
 
 interface VideoCompressionResult {
-  blob: Blob; // MP4 (H.264 video + original audio passthrough)
+  blob: Blob; // H.264 MP4
   originalBytes: number;
   compressedBytes: number;
   durationMs: number;
@@ -120,42 +131,72 @@ type VideoCompressionProgressCallback = (
 ) => void;
 ```
 
-**Pipeline:** demux (mp4box.js) → `VideoDecoder` → `VideoEncoder` → mux (mp4box.js). Audio is copied straight from the input — no re-encode, no quality loss, no `AudioEncoder` codec headaches.
+All options are **automatically clamped against the source** — passing `maxWidth: 1920` to a 720p video uses 720p, passing `targetBitrate: 10_000_000` to a 4 Mbps source uses 4 Mbps, etc. The SDK never upscales.
 
-### `extractThumbnail(file, options?) => Promise<ThumbnailResult>`
+**Pipeline:** demux (mp4box) → decode → re-encode H.264 → mux (mp4box). Audio is passed through unchanged — no AAC re-encode, no quality loss.
+
+### `probeVideo(file)`
 
 ```ts
-interface ThumbnailResult {
-  blob: Blob; // JPEG
-  timestampSeconds: number; // where in the video this came from
+interface VideoMetadata {
+  width: number;
+  height: number;
+  fps: number;
+  bitrate: number;          // approximate, file size × 8 ÷ duration
+  durationSeconds: number;
+  codec: string;            // e.g. "avc1.640028" or "hvc1.1.6.L93.B0"
+  hasAudio: boolean;
+  audioCodec?: string;
+  audioSampleRate?: number;
+  audioChannels?: number;
 }
+```
 
-type ThumbnailQuality =
-  | "performance" // ~50 frames analyzed
-  | "balanced" // ~150 frames (default)
-  | "quality" // ~400 frames
-  | "best-quality"; // ~800 frames
+Read the source's resolution / framerate / bitrate **without** running the full compression pipeline. Use it to build UIs that constrain user choices to values ≤ the source.
+
+```ts
+import { probeVideo, compressVideo } from "@mdslabs/wc-media-compressor-sdk";
+
+const meta = await probeVideo(file);
+// Show the user options ≤ meta.width, ≤ meta.bitrate, etc.
+// Then:
+const result = await compressVideo(file, {
+  targetBitrate: 2_000_000,
+  maxWidth: Math.min(720, meta.width),
+  maxFps: 24,
+});
+```
+
+Internally `probeVideo` streams the file into mp4box and resolves the moment the `moov` box is parsed — no sample extraction, low memory cost. For phone-default MP4s (moov at the start) this is typically the first 4 MB.
+
+### `extractThumbnail(file, options?)`
+
+```ts
+type ThumbnailQuality = "performance" | "balanced" | "quality" | "best-quality";
 
 interface ThumbnailOptions {
   quality?: ThumbnailQuality;
   config?: Partial<ThumbnailConfig>; // fine-grained override
 }
+
+interface ThumbnailResult {
+  blob: Blob;              // JPEG
+  timestampSeconds: number;
+}
 ```
 
-Falls back to a pure `<video>`-element pipeline if the file isn't a parseable MP4/MOV.
-
-### `compressImage(file, options?, onProgress?) => Promise<CompressedImageOutput>`
+### `compressImage(file, options?, onProgress?)`
 
 ```ts
 type ImageOutputFormat = "jpeg" | "webp" | "png";
 type ImageCompressionPreset = "lossless" | "high" | "balanced" | "small" | "tiny";
 
 interface ImageCompressionOptions {
-  outputFormats?: ImageOutputFormat[]; // default: ['webp']
-  preset?: ImageCompressionPreset; // default: 'balanced'
-  quality?: number; // 0–1, overrides preset for JPEG/WebP
-  pngPreset?: ImageCompressionPreset; // override PNG-specific behaviour
-  targetSizeKB?: number; // binary-search quality to fit
+  outputFormats?: ImageOutputFormat[];          // default: ['webp']
+  preset?: ImageCompressionPreset;              // default: 'balanced'
+  quality?: number;                             // overrides preset for JPEG/WebP
+  pngPreset?: ImageCompressionPreset;           // force PNG-only mode independent of preset
+  targetSizeKB?: number;                        // binary-search quality to fit
   maxWidth?: number;
   maxHeight?: number;
   width?: number;
@@ -166,38 +207,119 @@ interface ImageCompressionOptions {
 type CompressedImageOutput = Record<ImageOutputFormat, File>;
 ```
 
-**Preset → format behaviour:**
+**Preset behaviour:**
 
-| Preset      | JPEG / WebP `quality` | PNG behaviour                            |
-| ----------- | --------------------- | ---------------------------------------- |
-| `lossless`  | 1.0                   | True lossless PNG-24/32 + oxipng         |
-| `high`      | 0.90                  | PNG-24, mild WebP precondition           |
-| `balanced`  | 0.80                  | **PNG-8 palette** (256 adaptive colours) |
-| `small`     | 0.60                  | **PNG-8 palette** (128 colours)          |
-| `tiny`      | 0.40                  | **PNG-8 palette** (32 colours)           |
+| Preset      | JPEG / WebP `quality` | PNG palette          | PNG longer-side cap |
+| ----------- | --------------------- | -------------------- | ------------------- |
+| `lossless`  | 1.0                   | none (PNG-24/32)     | none (original)     |
+| `high`      | 0.90                  | none (PNG-24/32)     | 1080 px             |
+| `balanced`  | 0.80                  | 256 adaptive colours | 720 px              |
+| `small`     | 0.60                  | 256 adaptive colours | 480 px              |
+| `tiny`      | 0.40                  | 128 adaptive colours | 240 px              |
 
-If you pass `quality` directly it overrides the preset for JPEG/WebP and is bucketed into the equivalent PNG mode (≥ 0.95 → `lossless`, ≥ 0.85 → `high`, ≥ 0.70 → `balanced`, ≥ 0.50 → `small`, else `tiny`).
+JPEG and WebP outputs keep their original dimensions — the longer-side cap is **PNG-only**.
 
-### `compressImages(items, maxConcurrency?) => Promise<BatchImageCompressionResult[]>`
+**Inflation guard.** If the matching-format output ends up ≥ input size, the slot is replaced with the original file's bytes under the configured output name. Cross-format conversions (e.g. JPEG → PNG) are never substituted (would mismatch mime type).
 
-Same as `compressImage`, but parallel and never throws — errors are captured per item.
+### `compressImages(items, maxConcurrency?)`
+
+```ts
+interface BatchImageCompressionItem {
+  file: File;
+  options?: ImageCompressionOptions;
+  onProgress?: (progress: number) => void;
+}
+
+interface BatchImageCompressionResult {
+  file: File;
+  output?: CompressedImageOutput;
+  error?: Error;                                // captured per-item; never throws
+}
+```
 
 ---
 
-## PNG behaviour
+## How PNG output works
 
-PNG is fundamentally a lossless format — `canvas.toBlob` ignores its quality argument. Naively re-encoding a photo as PNG balloons the output to 5–15× the source. To make PNG output actually useful the SDK runs a four-stage pipeline:
+PNG is fundamentally lossless — `canvas.toBlob('image/png')` ignores its quality argument. Naively re-encoding a photo as PNG balloons the output to 5–15× the source. To make PNG output actually useful, the SDK runs a four-stage pipeline:
 
-1. **WebP precondition** — round-trip the canvas through WebP at the preset's quality to strip photographic noise. Alpha is preserved (WebP supports it). Skipped for `lossless`.
-2. **Adaptive palette quantisation** — for `balanced` and below, a median-cut quantiser (the same algorithm `pngquant` uses) reduces the image to N adaptive colours. The palette tracks the image's actual colour distribution, so quality at 256 colours is far better than uniform posterisation.
-3. **PNG encode** — the browser writes a standard PNG via `canvas.toBlob`. With ≤ 256 unique colours, oxipng will convert this to **PNG-8 palette mode** automatically.
-4. **oxipng optimisation** — runs as WebAssembly (loaded on demand, ~160 KB single-thread build). Picks the best DEFLATE filter combination and re-packs the file. Always lossless at this step.
+1. **Dimension cap** — the canvas is scaled so its longer side ≤ the preset's cap (`1080 / 720 / 480 / 240` for `high / balanced / small / tiny`). Aspect ratio is preserved. This is the single biggest size lever.
+2. **Perceptual adaptive palette** — median-cut quantiser in **OKLab** colour space (perceptually uniform), boxes split by **variance** rather than longest axis, palette refined with 3 iterations of **k-means**. Quality at 256 colours is far above naïve median-cut because palette entries land where the eye actually discriminates (skin, sky, foliage). Floyd–Steinberg dithering completes the pass.
+3. **PNG encode (raw)** — oxipng writes the file directly from raw pixel data via `optimise_raw`, skipping the browser's libpng encoder. With ≤ 256 unique RGBA tuples after step 2, oxipng auto-converts to **PNG-8 palette mode**.
+4. **oxipng level 6** — exhaustive filter search + `optimiseAlpha: true` (strips uniformly-opaque alpha channels that block palette-mode conversion). WASM module is loaded on demand (~160 KB single-thread build).
 
-**Inflation guard.** If the compressed output happens to be ≥ the original (common for already-optimised graphics, screenshots, icons), the SDK returns the **original file unchanged** under the requested output name. Only triggers when the output format matches the input format and the caller didn't request a resize.
+## HEIC decoding
 
-**Alpha is preserved** through every preset. PNG-8 palette mode supports per-entry alpha via the `tRNS` chunk, so even `tiny` keeps transparent regions transparent. Smooth alpha gradients block oxipng's palette conversion (it requires ≤ 256 unique RGBA tuples), so the output stays as a quantised PNG-24 in those cases — still smaller than the original, just not palette-tiny.
+HEIC inputs use a two-tier decode path:
+
+1. **WebCodecs `ImageDecoder`** (Chrome 94+, Safari 16.4+) — native, hardware-accelerated.
+2. **libheif WASM** — automatically loaded when `ImageDecoder` is unavailable or rejects the file's HEIC variant. ~1.4 MB, downloaded only on first HEIC use.
+
+## HEVC video on Chrome
+
+Chrome ships without an HEVC decoder license, so iPhone HEVC video (`hvc1` / `hev1`) normally fails to decompress in the browser. The SDK transparently routes HEVC inputs through a **libde265 WASM worker** on Chrome:
+
+- Codec sniffing in the demux step → dispatches HEVC to the worker, H.264 to native `VideoDecoder`.
+- Worker decode runs on a dedicated thread; main thread stays responsive throughout.
+- YUV planes are packed to I420 and fed straight to the hardware `VideoEncoder` (output is always H.264 MP4).
+- 10-bit HEVC (Main10 / HDR) is rejected with a clear error rather than producing broken output. Workaround: in iPhone settings, switch to "Most Compatible".
+
+**Vite users:** add `optimizeDeps: { exclude: ['@yume-chan/libde265'] }` to your `vite.config.ts`. The emscripten module shape confuses Vite's dependency pre-bundler.
 
 ---
+
+## Runtime size
+
+| What gets shipped       | When                              | Size      |
+| ----------------------- | --------------------------------- | --------- |
+| Main SDK bundle         | always                            | 328 KB    |
+| HEVC decoder worker     | always (3 KB stub + lazy WASM)    | 3 KB      |
+| `oxipng` WASM           | on first PNG output               | ~160 KB   |
+| `libheif` WASM          | HEIC input + ImageDecoder absent  | ~1.4 MB   |
+| `libde265` WASM         | HEVC input + no native HEVC       | ~410 KB   |
+
+So a JPEG → WebP workflow pays only the 328 KB main bundle. iPhone-photo HEIC workflows on Chrome/Safari add ~160 KB (oxipng) if they also emit PNG. Firefox HEIC workflows add libheif. HEVC-on-Chrome adds libde265.
+
+## Comparison
+
+| | This SDK | FFmpeg WASM |
+|---|---|---|
+| Bundle size | ~330 KB main | 25–30 MB |
+| Hardware acceleration | ✅ GPU/VPU | ❌ CPU only |
+| Battery / heat impact | Low | High |
+| HEIC decode | Native or 1.4 MB libheif | WASM port |
+| HEVC decode (Chrome) | 410 KB libde265 worker | Bundled |
+| Audio re-encode | Passthrough (no loss) | Re-encoded |
+| Format breadth | MP4/MOV + JPEG/PNG/WebP/HEIC | Everything |
+
+If you need MKV → WebM, AVI → anything, audio normalisation — use FFmpeg WASM. If you need **fast, lightweight compression of phone media for upload** — use this.
+
+---
+
+## Development
+
+```bash
+git clone https://github.com/xxGreyscale/wc-media-compressor-sdk.git
+cd wc-media-compressor-sdk
+npm install
+npm run dev          # vite dev server for the bundled vanilla demo
+npm run build        # tsup + tsc → dist/
+npm run typecheck
+npm run lint
+```
+
+Repository layout:
+
+```
+src/         # SDK source — published to npm
+  video/     # MP4 compression pipeline + HEVC worker
+  image/     # image compression (canvas + ImageDecoder + libheif paths)
+  thumbnail/ # best-frame extraction
+  shared/    # cross-module utilities
+demo/        # vanilla TS playground (not published)
+examples/    # framework examples (not published)
+  react-vite/
+```
 
 ## License
 

@@ -13,6 +13,7 @@ import {
 import { isHeicFile, getBaseName } from "./utils";
 import { compressWithCanvas } from "./canvas-compress";
 import { compressWithImageDecoder } from "./imagedecoder-compress";
+import { compressWithLibheif } from "./libheif-compress";
 import { ConcurrencyLimiter } from "../shared/concurrency";
 
 export type {
@@ -40,33 +41,29 @@ const MIME_TO_FORMAT: Record<string, ImageOutputFormat> = {
 };
 
 /**
- * If our re-encoded output is no smaller than the original file, return the
- * original instead. Only applies when the output format matches the input
- * format (e.g. PNG → PNG) and the caller didn't ask for dimension changes —
- * in those cases the user's existing file is already better than anything we
- * can produce, and substituting avoids the "why is my compressed image
- * bigger" surprise.
+ * If any of our re-encoded outputs ends up larger than the input, replace that
+ * slot with the original file. The user's existing file is already better than
+ * anything we can produce, and substituting avoids the "why is my compressed
+ * image bigger" surprise.
+ *
+ * Only applies when the slot's format matches the input's format — otherwise
+ * we'd hand back bytes that don't match the requested mime type / extension.
+ * Format mismatches happen on the caller's terms (e.g. JPEG → PNG conversion),
+ * so we leave those as-is even if they're larger.
  */
 function applyInflationGuard(
   input: File,
   output: CompressedImageOutput,
-  options: ImageCompressionOptions,
   outputFileName: string,
 ): CompressedImageOutput {
-  const userScaled =
-    options.maxWidth !== undefined ||
-    options.maxHeight !== undefined ||
-    options.width !== undefined ||
-    options.height !== undefined;
-  if (userScaled) return output;
-
   const inputFormat = MIME_TO_FORMAT[input.type];
   if (!inputFormat) return output;
 
   const slot = output[inputFormat];
   if (!slot || slot.size < input.size) return output;
 
-  // Rebuild the file under the requested output name but with the original bytes.
+  // Slot is ≥ input in the same format — substitute the original bytes under
+  // the configured output filename and mime type.
   output[inputFormat] = new File([input], slot.name || `${outputFileName}.${inputFormat}`, {
     type: IMAGE_MIME_TYPES[inputFormat],
     lastModified: Date.now(),
@@ -81,9 +78,11 @@ function applyInflationGuard(
  *   — no WASM, no server round-trip.
  * - All other formats use the Canvas API (`createImageBitmap`).
  * - If Canvas cannot decode the file, `ImageDecoder` is tried as a fallback.
- * - If the compressed output is no smaller than the original AND the format
- *   matches the input AND the caller didn't request a resize, the original
- *   file is returned unchanged (under the configured output name).
+ * - **Inflation guard**: when an output slot is in the same format as the input
+ *   and ends up larger than the input, the slot is replaced with the original
+ *   file's bytes under the configured output name. Cross-format outputs (e.g.
+ *   JPEG → PNG conversion) are left as-is since substituting would mismatch
+ *   the requested mime type.
  *
  * Outputs JPEG, WebP, or PNG — configurable via `options.outputFormats`.
  */
@@ -97,7 +96,18 @@ export async function compressImage(
 
   let result: CompressedImageOutput;
   if (isHeicFile(file)) {
-    result = await compressWithImageDecoder(file, resolved, outputFileName, onProgress);
+    // Primary path: WebCodecs `ImageDecoder` (Chrome 94+, Safari 16.4+).
+    // Fallback path: libheif-js WASM — covers Firefox and any browser whose
+    // ImageDecoder doesn't recognise the specific HEIC variant.
+    if ("ImageDecoder" in globalThis) {
+      try {
+        result = await compressWithImageDecoder(file, resolved, outputFileName, onProgress);
+      } catch {
+        result = await compressWithLibheif(file, resolved, outputFileName, onProgress);
+      }
+    } else {
+      result = await compressWithLibheif(file, resolved, outputFileName, onProgress);
+    }
   } else {
     try {
       result = await compressWithCanvas(file, resolved, outputFileName, onProgress);
@@ -107,7 +117,7 @@ export async function compressImage(
     }
   }
 
-  return applyInflationGuard(file, result, resolved, outputFileName);
+  return applyInflationGuard(file, result, outputFileName);
 }
 
 /**
